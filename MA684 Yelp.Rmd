@@ -1,0 +1,327 @@
+---
+title: "MA684 Final Project - Yelp Data Challenge"
+author: "Ziyan Li, Mark"
+date: "December 15, 2016"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(ISLR)
+library(leaps) 
+library(lme4)
+library(ordinal)
+library(gridExtra)
+library(knitr)
+library(sjPlot)
+library(sjmisc)
+```
+
+```{r, include=FALSE}
+### load data
+data.business <- readRDS('yelp_academic_dataset_business.rds')
+```
+
+```{r, include=FALSE}
+### data cleaning and recoding
+# filter by categories # Bars and #Nightlife
+data.bars <- data.business[grep("Bars",data.business$categories),]
+data.bars <- data.bars[grep("Nightlife",data.bars$categories),]
+# recode, turn state into country
+country=sapply(data.bars$state, FUN= 
+                 function(x) {ifelse(x %in% c("EDH","ELN","MLN"), "U.K", 
+                                     ifelse(x %in% "BW", "Germany",
+                                            ifelse(x %in% c("QC","ON"), "Canada","U.S")))})
+data.bars$country <- country
+# top20 most frequent categories (exclude Bars and Nightlife)
+categ20 <- as.data.frame(sort(table(unlist(data.bars$categories)), decreasing=TRUE)[3:22])
+names(categ20) <- c("category","count")
+#selected 10 features
+features <- data.frame(feature=c("Arts & Entertainment","Cocktail Bars","Dive Bars","Dance Club","Gay Bars",
+                         "Hookah Bars","Music Venues","Pubs","Sports Bars","Wine Bars"))
+features <- features %>% mutate(count=sapply(features$feature, function(x) length(data.bars$stars[grep(x,data.bars$categories)])),
+               ave.rating = sapply(features$feature, function(x) mean(data.bars$stars[grep(x,data.bars$categories)])))
+features <- features %>% mutate(U.S.count=sapply(features$feature, 
+                                                 function(x) length(subset(data.bars, country=="U.S")[grep(x,subset(data.bars, country=="U.S")$categories),]$stars)),
+                                U.S.ave = sapply(features$feature, 
+                                                 function(x) mean(subset(data.bars, country=="U.S")[grep(x,subset(data.bars, country=="U.S")$categories),]$stars)))
+features <- features %>% mutate(U.K.count=sapply(features$feature, 
+                                                 function(x) length(subset(data.bars, country=="U.K")[grep(x,subset(data.bars, country=="U.K")$categories),]$stars)),
+                                U.K.ave = sapply(features$feature, 
+                                                 function(x) mean(subset(data.bars, country=="U.K")[grep(x,subset(data.bars, country=="U.K")$categories),]$stars)))
+features <- features %>% mutate(Germany.count=sapply(features$feature, 
+                                                 function(x) length(subset(data.bars, country=="Germany")[grep(x,subset(data.bars, country=="Germany")$categories),]$stars)),
+                                Germany.ave = sapply(features$feature, 
+                                                 function(x) mean(subset(data.bars, country=="Germany")[grep(x,subset(data.bars, country=="Germany")$categories),]$stars)))
+features <- features %>% mutate(Canada.count=sapply(features$feature, 
+                                                     function(x) length(subset(data.bars, country=="Canada")[grep(x,subset(data.bars, country=="Canada")$categories),]$stars)),
+                                Canada.ave = sapply(features$feature, 
+                                                     function(x) mean(subset(data.bars, country=="Canada")[grep(x,subset(data.bars, country=="Canada")$categories),]$stars)))
+# plot
+ggplot(features) + geom_line(aes(x=1:10, y=U.S.ave), color="red") + geom_line(aes(x=1:10, y=U.K.ave), color="blue") + 
+  geom_line(aes(x=1:10, y=Germany.ave), color="green") + geom_line(aes(x=1:10, y=Canada.ave), color="yellow")
+
+ggplot(features) + geom_line(aes(x=1:10, y=U.S.ave), color="red") + geom_line(aes(x=1:10, y=Canada.ave), color="blue") + geom_line(aes(x=1:10, y=ave.rating), color="darkgreen", lty=3)
+# recode review count into factor since it varies a lot.
+review.factor <- ifelse(data.bars$review_count<10, "<10", 
+                        ifelse(data.bars$review_count<50,"10-50",
+                               ifelse(data.bars$review_count<100,"50-100",
+                                      ifelse(data.bars$review_count<500,"100-500",">500"))))
+review.factor <- ordered(review.factor, levels= c("<10","10-50","50-100","100-500",">500"))
+
+```
+
+```{r, include=FALSE}
+### EDA
+
+# review count
+ggplot(data.bars, aes(x=review.factor, y=stars, fill=review.factor)) + geom_boxplot()
+## selected attributes
+# smoking
+ggplot(data.bars, aes(x=attributes$`Smoking`, y=stars)) + geom_boxplot()
+# happy hour
+ggplot(data.bars, aes(x=attributes$`Happy Hour`, y=stars)) + geom_boxplot()
+# live music
+ggplot(data.bars, aes(x=attributes$Music$live, y=stars)) + geom_boxplot()
+# dj
+ggplot(data.bars, aes(x=attributes$Music$dj, y=stars)) + geom_boxplot()
+# outdoor seating
+ggplot(data.bars, aes(x=attributes$`Outdoor Seating`, y=stars)) + geom_boxplot()
+```
+
+```{r, include=FALSE}
+#design matrix
+# noise level
+noise <- data.frame(data.bars$attributes$`Noise Level`)
+names(noise) <- "noise"
+noise <- noise %>% mutate(noise.quiet=ifelse(is.na(noise),0,ifelse(noise=="quiet",1,0))) %>% mutate(
+                       noise.average=ifelse(is.na(noise),0,ifelse(noise=="average",1,0))) %>% mutate(
+                         noise.loud=ifelse(is.na(noise),0,ifelse(noise=="loud",1,0))) %>% mutate(
+                           noise.very_loud=ifelse(is.na(noise),0,ifelse(noise=="very_loud",1,0)))
+# smoking
+smoking <- data.frame(data.bars$attributes$`Smoking`)
+names(smoking) <- "smoking"
+smoking <- smoking %>% mutate(smoking.outdoor=ifelse(is.na(smoking),0,ifelse(smoking=="outdoor",1,0))) %>% mutate(
+                       smoking.no=ifelse(is.na(smoking),0,ifelse(smoking=="no",1,0))) %>% mutate(
+                         smoking.yes=ifelse(is.na(smoking),0,ifelse(smoking=="yes",1,0)))
+# happy hour
+happyhour <- data.frame(data.bars$attributes$`Happy Hour`)
+names(happyhour) <- "happyhour"
+happyhour <- happyhour %>% mutate(happyhour.yes=ifelse(is.na(happyhour),0,ifelse(happyhour==TRUE,1,0))) %>% mutate(
+                       happyhour.no=ifelse(is.na(happyhour),0,ifelse(happyhour==FALSE,1,0)))
+# live music
+livemusic <- data.frame(data.bars$attributes$Music$live)
+names(livemusic) <- "livemusic"
+livemusic <- livemusic %>% mutate(livemusic.yes=ifelse(is.na(livemusic),0,ifelse(livemusic==TRUE,1,0))) %>% mutate(
+                       livemusic.no=ifelse(is.na(livemusic),0,ifelse(livemusic==FALSE,1,0)))
+#dj
+dj <- data.frame(data.bars$attributes$Music$dj)
+names(dj) <- "dj"
+dj <- dj %>% mutate(dj.yes=ifelse(is.na(dj),0,ifelse(dj==TRUE,1,0))) %>% mutate(
+                       dj.no=ifelse(is.na(dj),0,ifelse(dj==FALSE,1,0)))
+# outdoor seating
+outdoor <- data.frame(data.bars$attributes$`Outdoor Seating`)
+names(outdoor) <- "outdoor"
+outdoor <- outdoor %>% mutate(outdoor.yes=ifelse(is.na(outdoor),0,ifelse(outdoor==TRUE,1,0))) %>% mutate(
+                       outdoor.no=ifelse(is.na(outdoor),0,ifelse(outdoor==FALSE,1,0)))
+# has TV
+TV <- data.frame(data.bars$attributes$`Has TV`)
+names(TV) <- "TV"
+TV <- TV %>% mutate(TV.yes=ifelse(is.na(TV),0,ifelse(TV==TRUE,1,0))) %>% mutate(
+                       TV.no=ifelse(is.na(TV),0,ifelse(TV==FALSE,1,0)))
+# price range
+price <- data.bars$attributes$`Price Range`
+```
+
+```{r, include=FALSE}
+## variable selection
+# matrix of 10 selected categories
+matrix.feature <- data.frame(matrix(0,4742,10))
+names(matrix.feature) <- as.vector(features$feature)
+for (i in 1:10){ 
+  matrix.feature[grep((features$feature)[i], data.bars$categories),i] <- 1
+  }
+# design matrix
+design.matrix <- data.frame(matrix.feature, noise[-1], smoking[-1], happyhour[-1], livemusic[-1], dj[-1], outdoor[-1], TV[-1], price)
+# subset selection
+fit.full <- regsubsets(data.bars$stars~. , data=design.matrix, nvmax=28)
+summary(fit.full)
+reg.summary <- summary(fit.full)
+## choose model based on different model selection criteria 
+reg.summary$rsq  
+par(mfrow=c(2,2))
+# RSS
+plot(reg.summary$rss,xlab="Number of Variables",ylab="RSS",type="l")
+# adjusted R² 
+plot(reg.summary$adjr2,xlab="Number of Variables",ylab="Adjusted RSq",type="l")
+which.max(reg.summary$adjr2)
+points(which.max(reg.summary$adjr2),reg.summary$adjr2[which.max(reg.summary$adjr2)], col="red",cex=2,pch=20)
+# C_p
+plot(reg.summary$cp,xlab="Number of Variables",ylab="Cp",type='l')
+which.min(reg.summary$cp)
+points(which.min(reg.summary$cp),reg.summary$cp[which.min(reg.summary$cp)],col="red",cex=2,pch=20)
+# BIC
+plot(reg.summary$bic,xlab="Number of Variables",ylab="BIC",type='l')
+which.min(reg.summary$bic)
+points(which.min(reg.summary$bic),reg.summary$bic[which.min(reg.summary$bic)],col="red",cex=2,pch=20)
+#
+coef(fit.full, 13)
+```
+
+
+
+\section*{Introduction}
+The Yelp challenge dataset is so profound that many topics could be addressed. This project will narrow down the scope to a particular research question and focus on the implementation of mixed effect model. The topic going to be discussed is the cultural differences among four countries (U.S, U.K, Germany and Canada) in terms of the preferences when people go to bars and enjoy their nightlife. More specificly, what will affect people's ratings and is such a impact varies among different countries?
+
+\section*{Data Cleaning and Recoding}
+
+Let us subset the business dataset by searching key words of "Bars" and "Nightlife" in categories, for the reason that it is the most effecient way to filter out the business that we are interested in. Merely using either one of them for filtering will cause some trouble, since we are not interested in over 800 sushi bars or a pizza shop opens at night. Additionally, the highly frequent co-occurence of "Bars" and "Nightlife" ensure that we don't lose much information and finally we captured 4742 businesses. Meanwhile, since we are interested in the cultural difference which makes more sense on a country level instead of a state or city level, we need to recode the location information into countries using: $U.K=\{EDH, ELN, MLN\}$, $Germany=\{BW\}$, $Canada=\{QC,ON\}$ and $U.S=\{PA,IL,NC,NV,WI,AZ,SC\}$. Recoding variables are not trivial
+in this case and I will address that in the Design Matrix section.
+
+\section*{Exploratory Data Analysis}
+The exploratory data analysis aims to find the source of variation for the response variable which in this case is the business average rating. First of all, the variation might come from the categories that one business belongs to. From a business owner's perspective, will adding a certain category label to its business profile affect the expected rating and what category will it be? Here I select 10 features that we might be interested in and probably will affect the average rating from the top 20 most frequent ones. [see Appendix.1] The follwing two figures shows variation of ratings among countries and our selected features.\
+\
+```{r, echo=FALSE, fig.width=9, fig.height=3, warning=FALSE}
+# variation of ratings among features
+p3 <- ggplot(features,aes(x=feature,y=ave.rating, fill=ave.rating)) + geom_bar(stat="identity") + ggtitle("Variation of Ratings among Features") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# comparison among country
+p4 <- ggplot(data.bars, aes(x=country, y=stars, fill=country)) + geom_boxplot() + scale_fill_brewer(palette=1) + ggtitle("Comparison among Countries") + theme(legend.position="bottom", legend.direction="horizontal")
+grid.arrange(p4,p3,ncol=2)
+```
+
+If we break it down, we will see more variation on the country level which might lead us to treat them as random effect in our model. 
+
+```{r, echo=FALSE, fig.width=9, fig.height=4, warning=FALSE, message=FALSE}
+# Average Ratings for Category (gap refers to missing value)
+ggplot(features) + geom_line(aes(x=feature, y=ave.rating))+ geom_path(aes(x=1:10, y=U.S.ave, color="U.S")) +
+  geom_path(aes(x=1:10, y=Canada.ave, color="Canada")) + geom_path(aes(x=1:10, y=ave.rating, color="Average"), lty=3) +
+  geom_path(aes(x=1:10, y=Germany.ave, color="Germany")) + geom_path(aes(x=1:10, y=U.K.ave, color="U.K")) + 
+  scale_colour_manual(name="Line Color", values=c(U.S="red", Canada="blue", Germany="darkgreen", U.K="purple", Average="yellow")) + 
+  ggtitle("Average Ratings for Category (gap refers to missing value)") + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+Besides, after exploration fro other variables,the following atributes might have a fixed effect to the average business rating and the variation is visualized in the following.\
+\
+```{r, echo=FALSE, fig.width=9, fig.height=3}
+# comparison for selected attributes
+# comparison among price range
+p5 <- ggplot(data.bars[!is.na(data.bars$attributes$`Price Range`),], aes(x=factor(attributes$`Price Range`), y=stars, fill=factor(attributes$`Price Range`))) + geom_boxplot() + scale_fill_brewer(palette=2) + ggtitle("Price Range") + theme(legend.position="bottom", legend.direction="horizontal") + labs(fill="")
+# noise level
+p6 <- ggplot(data.bars, aes(x=attributes$`Noise Level`, y=stars, fill=attributes$`Noise Level`)) + geom_boxplot() + scale_fill_brewer(palette=3) + ggtitle("Noise Level") + theme(legend.position="bottom", legend.direction="horizontal") + labs(fill="")
+# has tv?
+p7 <- ggplot(data.bars[!is.na(data.bars$attributes$`Has TV`),], aes(x=attributes$`Has TV`, y=stars, fill=attributes$`Has TV`)) + geom_boxplot() + scale_fill_brewer(palette=1) + ggtitle("TV Availability") + theme(legend.position="bottom", legend.direction="horizontal") + labs(fill="")
+grid.arrange(p5,p6,p7, ncol=3)
+```
+
+\section*{Design Matrix and Variable selection}
+
+\subsubsection*{1.Design Matrix}
+One major challenge here is that there are lots of NAs since most of the information input are optional for those business owner. Simply omitting them is not reasonable and not necessary and it will dramatically shrink the number of obsercations. Thinking it carefully, in this case, these NAs are not missing value. Instead, they are more like baselines, as it refer to the situation where business owners are not willing to provide information. From a modeling perspective, adding a piece of information will probably increase the expected rating but it is possible to the other way around since we do not know the sign of the coefficient before we fit the model. Thus, "no response" will not affect the expected rating no matter what the coefficient will be. Therefore, the more reasonable way is to recode variables into several columns and treat NAs as baseline (i.e, 0), and construct a design matrix for modeling.
+
+\subsubsection*{2.Variable Selection}
+As for variable selection, we can start with all the reasonable ones and use the best subset selection method as a reference. Here, I start with 10 category variables (mentioned previously), noise level, smoking availability, happy hour, live music, outdoor seating, has TV or not and price range. After recoding construct a design matrix with 28 columns and apply the best subset selection. Here is the result.
+
+```{r, echo=FALSE, fig.width=9, fig.height=3}
+par(mfrow=c(1,3))
+# adjusted Rsq 
+plot(reg.summary$adjr2,xlab="Number of Variables",ylab="Adjusted RSq",type="l")
+points(which.max(reg.summary$adjr2),reg.summary$adjr2[which.max(reg.summary$adjr2)], col="red",cex=2,pch=20)
+# C_p
+plot(reg.summary$cp,xlab="Number of Variables",ylab="Cp",type='l')
+points(which.min(reg.summary$cp),reg.summary$cp[which.min(reg.summary$cp)],col="red",cex=2,pch=20)
+# BIC
+plot(reg.summary$bic,xlab="Number of Variables",ylab="BIC",type='l')
+points(which.min(reg.summary$bic),reg.summary$bic[which.min(reg.summary$bic)],col="red",cex=2,pch=20)
+```
+
+Let us take the model with minimum BIC with 13 variables, which seems good as it reduce the dimension of our data by half. The 13 variables as well as their coefficients from a linear model are shown below.
+
+```{r, echo=FALSE}
+kable(as.data.frame(round(coef(fit.full, 13), digit=4)))
+```
+
+\section*{Mixed Effect Model}
+
+\subsubsection*{1.Linear Mixed Effect Model}
+
+```{r, include=FALSE}
+bars <- data.frame(data.bars$business_id, data.bars$stars, data.bars$country, matrix.feature[-c(3,5,7,8)], noise[-1], smoking[-1], dj[-1], TV[-1], price)
+names(bars)[1:3] <- c("business_id","stars","country")
+```
+
+```{r, include=FALSE}
+# linaer mixed effect model with varying slopes
+fit <- lmer(stars~noise.average+noise.quiet+noise.very_loud+smoking.yes+dj.yes+TV.no+price+
+              (Arts...Entertainment+Cocktail.Bars+Dance.Club+Hookah.Bars+Sports.Bars+
+                 Wine.Bars|country), data = bars)
+```
+
+The model can be expressed as:
+$$y_i = \beta_{0j[i]} + \beta_{1}X_{i}^{noise.quiet} + \beta_{2}X_{i}^{noise.average} + \beta_{3}X_{i}^{noise.very_loud} + \beta_{4}X_{i}^{smoking.yes} + \beta_{5}X_{i}^{dj.yes} + \beta_{6}X_{i}^{TV.no} + \beta_{7}X_{i}^{price}$$
+$$+u_{1j[i]}X_{i}^{Arts.Entertainment} + u_{2j[i]}X_{i}^{Cocktail.Bars} + u_{3j[i]}X_{i}^{Dance.Club} + u_{4j[i]}X_{i}^{Hookah.Bars} + u_{5j[i]}X_{i}^{Sports.Bars}$$
+$$ + u_{6j[i]}X_{i}^{Wine.Bars} + e_i$$
+
+\subsubsection*{2.Interpretation}
+
+```{r, echo=FALSE}
+kable(as.data.frame(fixef(fit)))
+```
+
+The fixed effect is shown above, and the estimated coefficients are quite similar to those in the previous linear model. Generally, noise.average, noise.quiet, smoking.yes, and TV.no have positive effect while the rest have negative effect. Note that in this model, taking TV as an example, a TV.yes is equivalent to no information, which means that adding a "TV.yes" to one's business profile will not affect the expected rating. And interestingly, having a "TV.no" feature will even lead to a higher expected rating. Similarly interpretation can be made to other coefficients in the same way. Meanwhile, the random effect is shown in the following:
+
+```{r, echo=FALSE, fig.width=9, fig.height=3, message=FALSE}
+# visualise random effect
+sjp.lmer(fit, y.offset = .4)
+```
+
+As we expected before, there seems some cultural differences in terms of people's attitudes towards diferent type of bars. In general, Germen are giving higher rating to bars compared to people from the other three countries, but cocktail bars and hookah bars seem not as welcomed in Germany. Besides, add a sports bar feature will lower your expected rating no matter where. Other interesting interpretations can be made in the same way.
+
+
+```{r, echo=FALSE, fig.width=4, fig.height=3}
+plot(fit)
+```
+\subsubsection*{3.Diagnostics}
+The pearson residual plot of our model looks okay, since we are fitting a continuous model to a ordinal variable. But there is no obvious weird pattern except the spread increases in the middle, which is reasonable as most ratings fall into this part. We can also look into other diagnostics such as the correlation matrix for fixed effect [see Appendix.2] and qq-plot for random effect [see Appendix.3]. The correlation matrix does not suggest any high correlation for fixed effect because we did not include all the recoded dummy variables. The qq-plot looks okay, too. All the points fall into both sides of the q-norm line and the assumption for normality of random effect is not violated.
+
+\subsubsection*{4.Further Discussion}
+
+Though unable to find a pakage that can be used to fit a multinomial fixed effect model with multiple group level predictors, the clmm2{ordinal} allows to fit a cumulative link mixed model with one random effect. In the appendix [see Appendix.4], I tried different multinomial mixed models and run a likelihood ratio test to confirm that both the category variables and the country term are significant. In addition the AIC for the multinomial mixed effect model is quite large compare to the linear mixed effect model due to the absence of group level predictors, which in a sense support the significance of the random effects. Besides, I did not use the user data and the review data in this project. It is pretty likely that user will bring much variation to our model which might lead to a totally different result. Hence, in the future, it will be good to look at these two data set and conduct some further analysis.
+
+\section*{Conclusion}
+Although the mixed effect model might not be a perfect approach to fit rating data, the outcome seems well after checking the goodness of fit. It seems like there is a cultural difference among these countries in terms of people's attitudes toward bars. In general, German bars receive a higher rating on average. But a particular category might be welcomed in a country but is not as the same in others, such as cocktail bars. There are other interesting conclusion can be drawn from the model. Meanwhile, the limitation of the model has been discussed before and the further step is to look into other datasets where other appraoches and models will be adopted.
+
+\newpage
+\section*{Appendix}
+
+\subsubsection*{1.Exploratory Data Analysis (continued)}
+```{r, echo=FALSE, fig.width=9, fig.height=3}
+# top20 categories
+p1 <- ggplot(categ20, aes(x=category, y=count, fill=count)) + geom_bar(stat="identity") + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ggtitle("Top20 Most Frequent Categories")
+# selected 10 features
+p2 <- ggplot(features,aes(x=feature,y=count, fill=count)) + geom_bar(stat="identity") + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ggtitle("10 Selected Categories/Features to our Interest")
+grid.arrange(p1,p2,ncol=2)
+```
+
+\subsubsection*{2.Fixed Effect Correlation Matrix}
+```{r, echo=FALSE, fig.width=6, fig.height=4, message=FALSE}
+# fix effect correlation matrix
+sjp.lmer(fit, type = "fe.cor")
+```
+
+\subsubsection*{3.QQ-Plot for Random Effect}
+```{r, echo=FALSE, fig.width=7, fig.height=6, message=FALSE}
+# qq plot to check the assumption for nomality of random effect
+sjp.lmer(fit, type = "re.qq")
+```
+
+\subsubsection*{4.Multinomial Mixed Effect Model and Likelihood Ratio Test}
+```{r}
+# multinomial mixed effect model
+fit.1 <- clmm2(factor(stars)~noise.average+noise.quiet+noise.very_loud+smoking.yes+dj.yes+TV.no+price, random=country, Hess=TRUE, data=bars)
+fit.2 <- clm2(factor(stars)~noise.average+noise.quiet+noise.very_loud+smoking.yes+dj.yes+TV.no+price+Arts...Entertainment+Cocktail.Bars+Dance.Club+Hookah.Bars+Sports.Bars+Wine.Bars, data=bars)
+fit.3 <- clmm2(factor(stars)~noise.average+noise.quiet+noise.very_loud+smoking.yes+dj.yes+TV.no+price+Arts...Entertainment+Cocktail.Bars+Dance.Club+Hookah.Bars+Sports.Bars+Wine.Bars, random=country, Hess=TRUE, data=bars)
+anova(fit.1, fit.2, fit.3)
+```
+
